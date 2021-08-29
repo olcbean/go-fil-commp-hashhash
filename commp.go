@@ -10,12 +10,11 @@
 package commp
 
 import (
+	sha256simd "github.com/minio/sha256-simd"
+	"golang.org/x/xerrors"
 	"hash"
 	"math/bits"
 	"sync"
-
-	sha256simd "github.com/minio/sha256-simd"
-	"golang.org/x/xerrors"
 )
 
 // Calc is an implementation of a commP "hash" calculator, implementing the
@@ -27,7 +26,9 @@ type Calc struct {
 }
 type state struct {
 	bytesConsumed uint64
-	layerQueues   [MaxLayers + 2]chan []byte // one extra layer for the initial leaves, one more for the dummy never-to-use channel
+	semaphore     [MaxLayers + 2]sync.Cond   // one extra layer for the initial leaves, one more for the dummy never-to-use channel
+	layerDone     [MaxLayers + 2]chan struct{} // one extra layer for the initial leaves, one more for the dummy never-to-use channel
+	layerBuf      [MaxLayers + 2][]byte
 	resultCommP   chan []byte
 	carry         []byte
 }
@@ -48,7 +49,7 @@ const MaxPiecePayload = uint64(127 * (1 << (5 + MaxLayers - 7)))
 const MinPiecePayload = uint64(65)
 
 var (
-	layerQueueDepth   = 256 // SANCHECK: too much? too little? can't think this through right now...
+	//layerQueueDepth   = 256 // SANCHECK: too much? too little? can't think this through right now...
 	shaPool           = sync.Pool{New: func() interface{} { return sha256simd.New() }}
 	stackedNulPadding [MaxLayers][]byte
 )
@@ -85,7 +86,12 @@ func (cp *Calc) Reset() {
 	if cp.bytesConsumed != 0 {
 		// we are resetting without digesting: close everything out to terminate
 		// the layer workers
-		close(cp.layerQueues[0])
+
+		//fmt.Printf("signal layer 0 close \n")
+		close(cp.layerDone[0])
+		cp.semaphore[0].L.Unlock()
+		cp.semaphore[0].Broadcast()
+
 		<-cp.resultCommP
 	}
 	cp.state = state{} // reset
@@ -138,7 +144,11 @@ func (cp *Calc) Digest() (commP []byte, paddedPieceSize uint64, err error) {
 
 	// This is how we signal to the bottom of the stack that we are done
 	// which in turn collapses the rest all the way to resultCommP
-	close(cp.layerQueues[0])
+
+	close(cp.layerDone[0])
+	//fmt.Printf("signal layer 0 close \n")
+	cp.semaphore[0].L.Unlock()
+	cp.semaphore[0].Broadcast()
 
 	// hacky round-up-to-next-pow2
 	paddedPieceSize = ((cp.bytesConsumed + 126) / 127 * 128) // why is 6 afraid of 7...?
@@ -177,7 +187,9 @@ func (cp *Calc) Write(input []byte) (int, error) {
 	if cp.bytesConsumed == 0 {
 		cp.carry = make([]byte, 0, 127)
 		cp.resultCommP = make(chan []byte, 1)
-		cp.layerQueues[0] = make(chan []byte, layerQueueDepth)
+		cp.layerDone[0] = make(chan struct{})
+		cp.semaphore[0] = sync.Cond{L: new(sync.Mutex)}
+		cp.layerBuf[0] = make([]byte, 32)
 		cp.addLayer(0)
 	}
 
@@ -244,8 +256,15 @@ func (cp *Calc) digestLeading127Bytes(input []byte) {
 	expander[63] &= 0x3F
 
 	// ready to dispatch first half
-	cp.layerQueues[0] <- expander[0:32]
-	cp.layerQueues[0] <- expander[32:64]
+	copy(cp.layerBuf[0], expander[0:32])
+	//fmt.Printf("layer 0 chunk 0 written \n")
+	cp.semaphore[0].Broadcast()
+	cp.semaphore[0].Wait()
+
+	copy(cp.layerBuf[0], expander[32:64])
+	//fmt.Printf("layer 0 chunk 1 written \n")
+	cp.semaphore[0].Broadcast()
+	cp.semaphore[0].Wait()
 
 	//  In: {{ C[7] C[6] C[5] C[4] }} X[7] X[6] X[5] X[4] X[3] X[2] X[1] X[0] Y[7] Y[6] Y[5] Y[4] Y[3] Y[2] Y[1] Y[0] Z[7] Z[6] Z[5]...
 	// Out:                           X[3] X[2] X[1] X[0] C[7] C[6] C[5] C[4] Y[3] Y[2] Y[1] Y[0] X[7] X[6] X[5] X[4] Z[3] Z[2] Z[1]...
@@ -265,72 +284,104 @@ func (cp *Calc) digestLeading127Bytes(input []byte) {
 	expander[127] = input[126] >> 2
 
 	// and dispatch remainder
-	cp.layerQueues[0] <- expander[64:96]
-	cp.layerQueues[0] <- expander[96:128]
+	copy(cp.layerBuf[0], expander[64:96])
+	//fmt.Printf("layer 0 chunk 2 written \n")
+	cp.semaphore[0].Broadcast()
+	cp.semaphore[0].Wait()
+
+	copy(cp.layerBuf[0], expander[96:128])
+	//fmt.Printf("layer 0 chunk 3 written \n")
+	cp.semaphore[0].Broadcast()
+	cp.semaphore[0].Wait()
 }
 
 func (cp *Calc) addLayer(myIdx uint) {
 	// the next layer channel, which we might *not* use
-	if cp.layerQueues[myIdx+1] != nil {
+	if cp.layerDone[myIdx+1] != nil {
 		panic("addLayer called more than once with identical idx argument")
 	}
-	cp.layerQueues[myIdx+1] = make(chan []byte, layerQueueDepth)
+
+	cp.semaphore[myIdx].L.Lock()
+
+	cp.layerDone[myIdx+1] = make(chan struct{})
+	cp.semaphore[myIdx+1] = sync.Cond{L: new(sync.Mutex)}
+	cp.layerBuf[myIdx+1] = make([]byte, 32)
+	//fmt.Printf("addLayer : %d\n", myIdx)
 
 	go func() {
 		var chunkHold []byte
 
+		cp.semaphore[myIdx].L.Lock()
+		defer cp.semaphore[myIdx].L.Unlock()
+
 		for {
-
-			chunk, queueIsOpen := <-cp.layerQueues[myIdx]
-
-			// the dream is collapsing
-			if !queueIsOpen {
-
+			select {
+			case <-cp.layerDone[myIdx]:
+				//fmt.Printf("reader layer %d case1\n", myIdx)
 				// I am last
-				if myIdx == MaxLayers || cp.layerQueues[myIdx+2] == nil {
+				if myIdx == MaxLayers || cp.layerDone[myIdx+2] == nil {
+					//fmt.Printf("reader layer %d case1 : I am last\n", myIdx)
 					cp.resultCommP <- chunkHold
 					return
 				}
 
 				if chunkHold != nil {
+					//fmt.Printf("reader layer %d case1 : chunkHold != nil\n", myIdx)
 					cp.hash254Into(
-						cp.layerQueues[myIdx+1],
+						myIdx+1,
 						chunkHold,
 						stackedNulPadding[myIdx],
 					)
 				}
 
 				// signal the next in line that they are done too
-				close(cp.layerQueues[myIdx+1])
+				//fmt.Printf("signal layer %d close \n", myIdx +1)
+				close(cp.layerDone[myIdx+1])
+				cp.semaphore[myIdx + 1].L.Unlock()
+				cp.semaphore[myIdx + 1].Broadcast()
+
 				return
-			}
+			default:
+				//fmt.Printf("reader layer %d default\n", myIdx)
+				chunk := append(make([]byte, 0), cp.layerBuf[myIdx]...)
+				//chunk := make([]byte, 32)
+				if chunkHold == nil {
+					chunkHold = chunk
+				} else {
 
-			if chunkHold == nil {
-				chunkHold = chunk
-			} else {
+					// We are last right now
+					// n.b. we will not blow out of the preallocated layerQueues array,
+					// as we disallow Write()s above a certain threshold
+					if cp.layerDone[myIdx+2] == nil {
+						cp.addLayer(myIdx + 1)
+					}
 
-				// We are last right now
-				// n.b. we will not blow out of the preallocated layerQueues array,
-				// as we disallow Write()s above a certain threshold
-				if cp.layerQueues[myIdx+2] == nil {
-					cp.addLayer(myIdx + 1)
+					cp.hash254Into(myIdx+1, chunkHold, chunk)
+					chunkHold = nil
 				}
-
-				cp.hash254Into(cp.layerQueues[myIdx+1], chunkHold, chunk)
-				chunkHold = nil
 			}
+
+			cp.semaphore[myIdx].Broadcast()
+			//fmt.Printf("reader layer %d wait start \n", myIdx)
+			cp.semaphore[myIdx].Wait()
+			//fmt.Printf("reader layer %d wait end\n", myIdx)
 		}
 	}()
+
+
 }
 
-func (cp *Calc) hash254Into(out chan<- []byte, half1ToOverwrite, half2 []byte) {
+func (cp *Calc) hash254Into(targetIdx uint, half1ToOverwrite, half2 []byte) {
+	//fmt.Printf("hash254Into : %d\n", targetIdx)
 	h := shaPool.Get().(hash.Hash)
 	h.Reset()
 	h.Write(half1ToOverwrite)
 	h.Write(half2)
 	d := h.Sum(half1ToOverwrite[:0]) // callers expect we will reuse-reduce-recycle
 	d[31] &= 0x3F
-	out <- d
+	copy(cp.layerBuf[targetIdx], d)
+	cp.semaphore[targetIdx].Broadcast()
+	cp.semaphore[targetIdx].Wait()
 	shaPool.Put(h)
 }
 

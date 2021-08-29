@@ -20,7 +20,7 @@ type testCase struct {
 	RawCommP    []byte
 }
 
-const benchSize = 4 << 20 // MiB
+const benchSize = 128 << 20 // MiB
 
 func BenchmarkCommP(b *testing.B) {
 	// reuse both the calculator and reader in every loop
