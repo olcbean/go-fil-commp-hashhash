@@ -18,6 +18,7 @@ type testCase struct {
 	PayloadSize int64
 	PieceSize   uint64
 	RawCommP    []byte
+	Base32CommP string
 }
 
 const benchSize = 4 << 20 // MiB
@@ -128,48 +129,54 @@ func (rr *repeatedReader) Read(p []byte) (n int, err error) {
 	return len(p), nil
 }
 
-func TestZero(t *testing.T) {
-	t.Parallel()
+//func TestZero(t *testing.T) {
+//	t.Parallel()
+//
+//	tests, err := getTestCases("testdata/zero.txt")
+//	if err != nil {
+//		t.Fatal(err)
+//	}
+//
+//	for _, test := range tests {
+//		test := test
+//		t.Run(fmt.Sprintf("%d", test.PayloadSize), func(t *testing.T) {
+//			t.Parallel()
+//			r := io.LimitReader(&repeatedReader{b: 0x00}, test.PayloadSize)
+//			if err := verifyReaderSizeAndCommP(t, r, test); err != nil {
+//				t.Fatal(err)
+//			}
+//		})
+//	}
+//}
 
-	tests, err := getTestCases("testdata/zero.txt")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	for _, test := range tests {
-		test := test
-		t.Run(fmt.Sprintf("%d", test.PayloadSize), func(t *testing.T) {
-			t.Parallel()
-			r := io.LimitReader(&repeatedReader{b: 0x00}, test.PayloadSize)
-			if err := verifyReaderSizeAndCommP(t, r, test); err != nil {
-				t.Fatal(err)
-			}
-		})
-	}
-}
-
-func Test0b11001100(t *testing.T) {
-	t.Parallel()
-
-	tests, err := getTestCases("testdata/0xCC.txt")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	for _, test := range tests {
-		test := test
-		t.Run(fmt.Sprintf("%d", test.PayloadSize), func(t *testing.T) {
-			t.Parallel()
-			r := io.LimitReader(&repeatedReader{b: 0xCC}, test.PayloadSize)
-			if err := verifyReaderSizeAndCommP(t, r, test); err != nil {
-				t.Fatal(err)
-			}
-		})
-	}
-}
+//func Test0b11001100(t *testing.T) {
+//	t.Parallel()
+//
+//	tests, err := getTestCases("testdata/0xCC.txt")
+//	if err != nil {
+//		t.Fatal(err)
+//	}
+//
+//	for _, test := range tests {
+//		test := test
+//		t.Run(fmt.Sprintf("%d", test.PayloadSize), func(t *testing.T) {
+//			t.Parallel()
+//			r := io.LimitReader(&repeatedReader{b: 0xCC}, test.PayloadSize)
+//			if err := verifyReaderSizeAndCommP(t, r, test); err != nil {
+//				t.Fatal(err)
+//			}
+//		})
+//	}
+//}
 
 func verifyReaderSizeAndCommP(t *testing.T, r io.Reader, test testCase) error {
+	lead:= make([]byte,16)
+	if _, err := r.Read(lead); err != nil {
+		t.Fatal(err)
+	}
+
 	cp := &Calc{}
+	cp.Write(lead)
 	if _, err := io.Copy(cp, r); err != nil {
 		t.Fatal(err)
 	}
@@ -181,7 +188,13 @@ func verifyReaderSizeAndCommP(t *testing.T, r io.Reader, test testCase) error {
 		return fmt.Errorf("produced padded size %d doesn't match expected size %d", paddedSize, test.PieceSize)
 	}
 	if !bytes.Equal(rawCommP, test.RawCommP) {
-		return fmt.Errorf("produced piececid 0x%X doesn't match expected 0x%X", rawCommP, test.RawCommP)
+		return fmt.Errorf("produced piececid 0x%X doesn't match expected 0x%X (%d bytes of '%x...', %s)",
+			rawCommP,
+			test.RawCommP,
+			test.PayloadSize,
+			lead,
+			test.Base32CommP,
+			)
 	}
 
 	return nil
@@ -216,6 +229,7 @@ func getTestCases(path string) ([]testCase, error) {
 			PayloadSize: payloadSize,
 			PieceSize:   pieceSize,
 			RawCommP:    rawCid[len(rawCid)-32:],
+			Base32CommP: parts[2],
 		})
 	}
 
