@@ -10,6 +10,8 @@
 package commp
 
 import (
+	"fmt"
+	bufferPool "github.com/libp2p/go-buffer-pool"
 	"hash"
 	"math/bits"
 	"sync"
@@ -23,13 +25,15 @@ import (
 // accept Write()s without further initialization.
 type Calc struct {
 	state
-	mu sync.Mutex
+	blockSize int
+	mu        sync.Mutex
 }
 type state struct {
-	bytesConsumed uint64
-	layerQueues   [MaxLayers + 2]chan []byte // one extra layer for the initial leaves, one more for the dummy never-to-use channel
-	resultCommP   chan []byte
-	carry         []byte
+	bytesConsumed  uint64
+	bytesProcessed uint64
+	layerQueues    [MaxLayers + 2]chan []byte // one extra layer for the initial leaves, one more for the dummy never-to-use channel
+	resultCommP    chan []byte
+	carry          []byte
 }
 
 var _ hash.Hash = &Calc{} // make sure we are hash.Hash compliant
@@ -133,10 +137,20 @@ func (cp *Calc) Digest() (commP []byte, paddedPieceSize uint64, err error) {
 
 	// If any, flush remaining bytes padded up with zeroes
 	if len(cp.carry) > 0 {
-		if len(cp.carry) < 127 {
-			cp.carry = append(cp.carry, make([]byte, 127-len(cp.carry))...)
+		if mod := len(cp.carry) % 127; mod != 0 {
+			cp.carry = append(cp.carry, make([]byte, 127-mod)...)
 		}
-		cp.digestLeading127Bytes(cp.carry)
+		for len(cp.carry) > 0 {
+			var num uint
+			for ; len(cp.carry) < 127*(1<<num); num++ {
+
+			}
+			if processed := cp.digestLeadingBytes(cp.carry[:127*(1<<num)]); processed != 127*(1<<num) {
+				panic(fmt.Sprintf("Did not process the whole buffer of %d, only %d ! ", 127*(1<<num), processed))
+			}
+			cp.carry = cp.carry[127*(1<<num):]
+
+		}
 	}
 
 	// This is how we signal to the bottom of the stack that we are done
@@ -178,7 +192,8 @@ func (cp *Calc) Write(input []byte) (int, error) {
 
 	// just starting: initialize internal state, start first background layer-goroutine
 	if cp.bytesConsumed == 0 {
-		cp.carry = make([]byte, 0, 127)
+		cp.blockSize = 127
+		cp.carry = make([]byte, 0, cp.blockSize)
 		cp.resultCommP = make(chan []byte, 1)
 		cp.layerQueues[0] = make(chan []byte, layerQueueDepth)
 		cp.addLayer(0)
@@ -186,25 +201,14 @@ func (cp *Calc) Write(input []byte) (int, error) {
 
 	cp.bytesConsumed += uint64(inputSize)
 
-	carrySize := len(cp.carry)
-	if carrySize > 0 {
-
-		// super short Write - just carry it
-		if carrySize+inputSize < 127 {
-			cp.carry = append(cp.carry, input...)
-			return inputSize, nil
-		}
-
-		cp.carry = append(cp.carry, input[:127-carrySize]...)
-		input = input[127-carrySize:]
-
-		cp.digestLeading127Bytes(cp.carry)
+	if len(cp.carry) > 0 {
+		input = append(input[:len(cp.carry)], input...)
+		copy(input[:len(cp.carry)], cp.carry)
 		cp.carry = cp.carry[:0]
 	}
-
-	for len(input) >= 127 {
-		cp.digestLeading127Bytes(input)
-		input = input[127:]
+	for len(input) >= cp.blockSize {
+		processed := cp.digestLeadingBytes(input)
+		input = input[processed:]
 	}
 
 	if len(input) > 0 {
@@ -215,61 +219,85 @@ func (cp *Calc) Write(input []byte) (int, error) {
 	return inputSize, nil
 }
 
-func (cp *Calc) digestLeading127Bytes(input []byte) {
+func (cp *Calc) digestLeadingBytes(inSlab []byte) (countProcessedBytes int) {
 
 	// Holds this round's shifts of the original 127 bytes plus the 6 bit overflow
 	// at the end of the expansion cycle. We *do not* reuse this array: it is
 	// being fed piece-wise to hash254Into which in turn reuses it for the result
-	var expander [128]byte
+	if len(inSlab) < 127 {
+		panic("Input shorter than 127 bytes")
+	}
+	maxCnt := 1 << uint(63-bits.LeadingZeros64(uint64(len(inSlab))/127))
 
-	// Cycle over four(4) 31-byte groups, leaving 1 byte in between:
-	// 31 + 1 + 31 + 1 + 31 + 1 + 31 = 127
-
-	// First 31 bytes + 6 bits are taken as-is (trimmed later)
-	// Note that copying them into the expansion buffer is mandatory:
-	// we will be feeding it to the workers which reuse the bottom half
-	// of the chunk for the result
-	copy(expander[:], input[:32])
-
-	// first 2-bit "shim" forced into the otherwise identical bitstream
-	expander[31] &= 0x3F
-
-	// simplify pointer math
-	inputPlus1, expanderPlus1 := input[1:], expander[1:]
-
-	//  In: {{ C[7] C[6] }} X[7] X[6] X[5] X[4] X[3] X[2] X[1] X[0] Y[7] Y[6] Y[5] Y[4] Y[3] Y[2] Y[1] Y[0] Z[7] Z[6] Z[5]...
-	// Out:                 X[5] X[4] X[3] X[2] X[1] X[0] C[7] C[6] Y[5] Y[4] Y[3] Y[2] Y[1] Y[0] X[7] X[6] Z[5] Z[4] Z[3]...
-	for i := 31; i < 63; i++ {
-		expanderPlus1[i] = inputPlus1[i]<<2 | input[i]>>6
+	maxConsumed := 1 << uint(63-bits.LeadingZeros64(cp.bytesProcessed/127))
+	minConsumed := 1 << uint(bits.TrailingZeros64(cp.bytesProcessed/127))
+	var limit int
+	if maxConsumed == minConsumed {
+		limit = maxConsumed
+	}
+	if maxConsumed == 0 {
+		limit = maxCnt
+	}
+	if minConsumed != 0 {
+		limit = minConsumed
 	}
 
-	// next 2-bit shim
-	expander[63] &= 0x3F
-
-	// ready to dispatch first half
-	cp.layerQueues[0] <- expander[0:32]
-	cp.layerQueues[0] <- expander[32:64]
-
-	//  In: {{ C[7] C[6] C[5] C[4] }} X[7] X[6] X[5] X[4] X[3] X[2] X[1] X[0] Y[7] Y[6] Y[5] Y[4] Y[3] Y[2] Y[1] Y[0] Z[7] Z[6] Z[5]...
-	// Out:                           X[3] X[2] X[1] X[0] C[7] C[6] C[5] C[4] Y[3] Y[2] Y[1] Y[0] X[7] X[6] X[5] X[4] Z[3] Z[2] Z[1]...
-	for i := 63; i < 95; i++ {
-		expanderPlus1[i] = inputPlus1[i]<<4 | input[i]>>4
+	chunkCnt := maxCnt
+	if maxCnt > limit {
+		chunkCnt = limit
 	}
 
-	// next 2-bit shim
-	expander[95] &= 0x3F
+	// outSlab := make([]byte, chunkCnt*128)
+	outSlab := bufferPool.Get(chunkCnt * 128)
 
-	//  In: {{ C[7] C[6] C[5] C[4] C[3] C[2] }} X[7] X[6] X[5] X[4] X[3] X[2] X[1] X[0] Y[7] Y[6] Y[5] Y[4] Y[3] Y[2] Y[1] Y[0] Z[7] Z[6] Z[5]...
-	// Out:                                     X[1] X[0] C[7] C[6] C[5] C[4] C[3] C[2] Y[1] Y[0] X[7] X[6] X[5] X[4] X[3] X[2] Z[1] Z[0] Y[7]...
-	for i := 95; i < 126; i++ {
-		expanderPlus1[i] = inputPlus1[i]<<6 | input[i]>>2
+	for j := 0; j < chunkCnt; j++ {
+		// Cycle over four(4) 31-byte groups, leaving 1 byte in between:
+		// 31 + 1 + 31 + 1 + 31 + 1 + 31 = 127
+		input := inSlab[j*127 : (j+1)*127]
+		expander := outSlab[j*128 : (j+1)*128]
+		inputPlus1, expanderPlus1 := input[1:], expander[1:]
+
+		// First 31 bytes + 6 bits are taken as-is (trimmed later)
+		// Note that copying them into the expansion buffer is mandatory:
+		// we will be feeding it to the workers which reuse the bottom half
+		// of the chunk for the result
+		copy(expander[:], input[:32])
+
+		// first 2-bit "shim" forced into the otherwise identical bitstream
+		expander[31] &= 0x3F
+
+		//  In: {{ C[7] C[6] }} X[7] X[6] X[5] X[4] X[3] X[2] X[1] X[0] Y[7] Y[6] Y[5] Y[4] Y[3] Y[2] Y[1] Y[0] Z[7] Z[6] Z[5]...
+		// Out:                 X[5] X[4] X[3] X[2] X[1] X[0] C[7] C[6] Y[5] Y[4] Y[3] Y[2] Y[1] Y[0] X[7] X[6] Z[5] Z[4] Z[3]...
+		for i := 31; i < 63; i++ {
+			expanderPlus1[i] = inputPlus1[i]<<2 | input[i]>>6
+		}
+
+		// next 2-bit shim
+		expander[63] &= 0x3F
+
+		//  In: {{ C[7] C[6] C[5] C[4] }} X[7] X[6] X[5] X[4] X[3] X[2] X[1] X[0] Y[7] Y[6] Y[5] Y[4] Y[3] Y[2] Y[1] Y[0] Z[7] Z[6] Z[5]...
+		// Out:                           X[3] X[2] X[1] X[0] C[7] C[6] C[5] C[4] Y[3] Y[2] Y[1] Y[0] X[7] X[6] X[5] X[4] Z[3] Z[2] Z[1]...
+		for i := 63; i < 95; i++ {
+			expanderPlus1[i] = inputPlus1[i]<<4 | input[i]>>4
+		}
+
+		// next 2-bit shim
+		expander[95] &= 0x3F
+
+		//  In: {{ C[7] C[6] C[5] C[4] C[3] C[2] }} X[7] X[6] X[5] X[4] X[3] X[2] X[1] X[0] Y[7] Y[6] Y[5] Y[4] Y[3] Y[2] Y[1] Y[0] Z[7] Z[6] Z[5]...
+		// Out:                                     X[1] X[0] C[7] C[6] C[5] C[4] C[3] C[2] Y[1] Y[0] X[7] X[6] X[5] X[4] X[3] X[2] Z[1] Z[0] Y[7]...
+		for i := 95; i < 126; i++ {
+			expanderPlus1[i] = inputPlus1[i]<<6 | input[i]>>2
+		}
+
+		// the final 6 bit remainder is exactly the value of the last expanded byte
+		expander[127] = input[126] >> 2
 	}
-	// the final 6 bit remainder is exactly the value of the last expanded byte
-	expander[127] = input[126] >> 2
 
-	// and dispatch remainder
-	cp.layerQueues[0] <- expander[64:96]
-	cp.layerQueues[0] <- expander[96:128]
+	cp.bytesProcessed += uint64(chunkCnt) * 127
+	cp.layerQueues[0] <- outSlab
+
+	return chunkCnt * 127
 }
 
 func (cp *Calc) addLayer(myIdx uint) {
@@ -283,24 +311,19 @@ func (cp *Calc) addLayer(myIdx uint) {
 		var chunkHold []byte
 
 		for {
-
-			chunk, queueIsOpen := <-cp.layerQueues[myIdx]
-
+			slab, queueIsOpen := <-cp.layerQueues[myIdx]
 			// the dream is collapsing
 			if !queueIsOpen {
 
 				// I am last
 				if myIdx == MaxLayers || cp.layerQueues[myIdx+2] == nil {
-					cp.resultCommP <- chunkHold
+					cp.resultCommP <- chunkHold[0:32]
 					return
 				}
 
 				if chunkHold != nil {
-					cp.hash254Into(
-						cp.layerQueues[myIdx+1],
-						chunkHold,
-						stackedNulPadding[myIdx],
-					)
+					copy(chunkHold[32:64], stackedNulPadding[myIdx])
+					cp.hashSlab254(0, chunkHold[0:64], cp.layerQueues[myIdx+1])
 				}
 
 				// signal the next in line that they are done too
@@ -308,8 +331,15 @@ func (cp *Calc) addLayer(myIdx uint) {
 				return
 			}
 
+			if len(slab) > 1<<(5+myIdx) {
+				cp.hashSlab254(myIdx, slab, cp.layerQueues[myIdx+1])
+				if cp.layerQueues[myIdx+2] == nil {
+					cp.addLayer(myIdx + 1)
+				}
+				continue
+			}
 			if chunkHold == nil {
-				chunkHold = chunk
+				chunkHold = slab[0:32]
 			} else {
 
 				// We are last right now
@@ -318,23 +348,43 @@ func (cp *Calc) addLayer(myIdx uint) {
 				if cp.layerQueues[myIdx+2] == nil {
 					cp.addLayer(myIdx + 1)
 				}
-
-				cp.hash254Into(cp.layerQueues[myIdx+1], chunkHold, chunk)
+				copy(chunkHold[32:64], slab[0:32])
+				cp.hashSlab254(0, chunkHold[0:64], cp.layerQueues[myIdx+1])
 				chunkHold = nil
 			}
 		}
 	}()
 }
 
-func (cp *Calc) hash254Into(out chan<- []byte, half1ToOverwrite, half2 []byte) {
-	h := shaPool.Get().(hash.Hash)
-	h.Reset()
-	h.Write(half1ToOverwrite)
-	h.Write(half2)
-	d := h.Sum(half1ToOverwrite[:0]) // callers expect we will reuse-reduce-recycle
-	d[31] &= 0x3F
-	out <- d
-	shaPool.Put(h)
+func (cp *Calc) hashSlab254(layerIdx uint, slab []byte, target chan []byte) {
+
+	stride := 1 << (5 + layerIdx)
+	if len(slab) < stride {
+		panic(fmt.Sprintf("wtf layerId: %d \t slab length: %d \n", layerIdx, len(slab)))
+	}
+
+	//var wg sync.WaitGroup
+	for i := 0; len(slab) > i+stride; i += 2 * stride {
+		// wg.Add(1)
+		i := i
+		//	go func() {
+		h := shaPool.Get().(hash.Hash)
+		h.Reset()
+		h.Write(slab[i : i+32])
+		h.Write(slab[i+stride : 32+i+stride])
+		// fmt.Printf("L:%d  left : %X, right : %X\n", layerIdx, slab[i:i+32],  slab[i+stride : 32+i+stride])
+		//h.Sum(slab[i:i])[31] &= 0x3F    // callers expect we will reuse-reduce-recycle
+		h.Sum(slab[i:i])[31] &= 0x3F // callers expect we will reuse-reduce-recycle
+		// fmt.Printf("res :  %X, layer : %d\n", slab[i:i+32], layerIdx)
+		//if bytes.Equal(slab[i:i+2], []byte{0x97,0xA1}) {
+		//	panic("panisc")
+		//}
+		shaPool.Put(h)
+		//wg.Done()
+		//	}()
+	}
+	//wg.Wait()
+	target <- slab
 }
 
 // PadCommP is experimental, do not use it.

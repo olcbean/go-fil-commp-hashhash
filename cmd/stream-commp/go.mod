@@ -2,6 +2,8 @@ module github.com/filecoin-project/go-fil-commp-hashhash/cmd/stream-commp
 
 go 1.11
 
+replace github.com/filecoin-project/go-fil-commp-hashhash => ../../
+
 require (
 	github.com/filecoin-project/go-fil-commcid v0.1.0
 	github.com/filecoin-project/go-fil-commp-hashhash v0.1.1-0.20210716094257-d9e25dd4bb3d

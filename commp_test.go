@@ -20,9 +20,10 @@ type testCase struct {
 	RawCommP    []byte
 }
 
-const benchSize = 4 << 20 // MiB
+const benchSize = 16 << 20 // MiB
 
 func BenchmarkCommP(b *testing.B) {
+	// fmt.Println("Starting")
 	// reuse both the calculator and reader in every loop
 	// the source is rewound explicitly
 	// the calc is reset implicitly on Digest()
@@ -59,6 +60,10 @@ func TestCommP(t *testing.T) {
 
 	for _, test := range tests {
 		test := test
+
+		if test.PayloadSize != 65024 {
+			continue
+		}
 		t.Run(fmt.Sprintf("%d", test.PayloadSize), func(t *testing.T) {
 			t.Parallel()
 			pr, pw := io.Pipe()
@@ -131,7 +136,7 @@ func (rr *repeatedReader) Read(p []byte) (n int, err error) {
 func TestZero(t *testing.T) {
 	t.Parallel()
 
-	tests, err := getTestCases("testdata/zero.txt")
+	tests, err := getTestCases("testdata/zero1.txt")
 	if err != nil {
 		t.Fatal(err)
 	}

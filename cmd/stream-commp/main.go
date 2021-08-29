@@ -26,7 +26,7 @@ func init() {
 	cbor.RegisterCborType(CarHeader{})
 }
 
-const BufSize = ((4 << 20) / 128 * 127)
+const BufSize = ((2 << 10) / 128 * 127)
 
 func main() {
 
