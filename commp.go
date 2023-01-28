@@ -10,8 +10,6 @@
 package commp
 
 import (
-	"fmt"
-	bufferPool "github.com/libp2p/go-buffer-pool"
 	"hash"
 	"math/bits"
 	"sync"
@@ -25,15 +23,13 @@ import (
 // accept Write()s without further initialization.
 type Calc struct {
 	state
-	blockSize int
-	mu        sync.Mutex
+	mu sync.Mutex
 }
 type state struct {
-	bytesConsumed  uint64
-	bytesProcessed uint64
-	layerQueues    [MaxLayers + 2]chan []byte // one extra layer for the initial leaves, one more for the dummy never-to-use channel
-	resultCommP    chan []byte
-	carry          []byte
+	quadsEnqueued uint64
+	layerQueues   [MaxLayers + 2]chan []byte // one extra layer for the initial leaves, one more for the dummy never-to-use channel
+	resultCommP   chan []byte
+	carry         []byte
 }
 
 var _ hash.Hash = &Calc{} // make sure we are hash.Hash compliant
@@ -43,6 +39,8 @@ const MaxLayers = uint(31) // result of log2( 64 GiB / 32 )
 
 // MaxPieceSize is the current maximum size of the rust-fil-proofs proving tree.
 const MaxPieceSize = uint64(1 << (MaxLayers + 5))
+
+const BlockSize = 127
 
 // MaxPiecePayload is the maximum amount of data that one can Write() to the
 // Calc object, before needing to derive a Digest(). Constrained by the value
@@ -89,7 +87,7 @@ func (cp *Calc) Size() int { return 32 }
 // in any state.
 func (cp *Calc) Reset() {
 	cp.mu.Lock()
-	if cp.bytesConsumed != 0 {
+	if len(cp.layerQueues) != 0 {
 		// we are resetting without digesting: close everything out to terminate
 		// the layer workers
 		close(cp.layerQueues[0])
@@ -127,29 +125,23 @@ func (cp *Calc) Digest() (commP []byte, paddedPieceSize uint64, err error) {
 		cp.mu.Unlock()
 	}()
 
-	if cp.bytesConsumed < MinPiecePayload {
+	if uint64(len(cp.carry))+(cp.quadsEnqueued*127) < MinPiecePayload {
 		err = xerrors.Errorf(
 			"insufficient state accumulated: commP is not defined for inputs shorter than %d bytes, but only %d processed so far",
-			MinPiecePayload, cp.bytesConsumed,
+			MinPiecePayload, len(cp.carry),
 		)
 		return
 	}
 
 	// If any, flush remaining bytes padded up with zeroes
 	if len(cp.carry) > 0 {
-		if mod := len(cp.carry) % 127; mod != 0 {
-			cp.carry = append(cp.carry, make([]byte, 127-mod)...)
+		input := cp.carry
+		cp.carry = cp.carry[:0]
+		if mod := len(input) % 127; mod != 0 {
+			input = append(input, make([]byte, 127-mod)...)
 		}
-		for len(cp.carry) > 0 {
-			var num uint
-			for ; len(cp.carry) < 127*(1<<num); num++ {
-
-			}
-			if processed := cp.digestLeadingBytes(cp.carry[:127*(1<<num)]); processed != 127*(1<<num) {
-				panic(fmt.Sprintf("Did not process the whole buffer of %d, only %d ! ", 127*(1<<num), processed))
-			}
-			cp.carry = cp.carry[127*(1<<num):]
-
+		for len(input) > 0 {
+			input = input[cp.digestLeadingBytes(input):]
 		}
 	}
 
@@ -157,8 +149,7 @@ func (cp *Calc) Digest() (commP []byte, paddedPieceSize uint64, err error) {
 	// which in turn collapses the rest all the way to resultCommP
 	close(cp.layerQueues[0])
 
-	// hacky round-up-to-next-pow2
-	paddedPieceSize = ((cp.bytesConsumed + 126) / 127 * 128) // why is 6 afraid of 7...?
+	paddedPieceSize = cp.quadsEnqueued * 128
 	if bits.OnesCount64(paddedPieceSize) != 1 {
 		paddedPieceSize = 1 << uint(64-bits.LeadingZeros64(paddedPieceSize))
 	}
@@ -183,7 +174,7 @@ func (cp *Calc) Write(input []byte) (int, error) {
 	cp.mu.Lock()
 	defer cp.mu.Unlock()
 
-	if cp.bytesConsumed+uint64(inputSize) > MaxPiecePayload {
+	if cp.quadsEnqueued*127+uint64(len(cp.carry))+uint64(inputSize) > MaxPiecePayload {
 		return 0, xerrors.Errorf(
 			"writing %d bytes to the accumulator would overflow the maximum supported unpadded piece size %d",
 			len(input), MaxPiecePayload,
@@ -191,69 +182,45 @@ func (cp *Calc) Write(input []byte) (int, error) {
 	}
 
 	// just starting: initialize internal state, start first background layer-goroutine
-	if cp.bytesConsumed == 0 {
-		cp.blockSize = 127
-		cp.carry = make([]byte, 0, cp.blockSize)
+	if cp.carry == nil {
+		cp.carry = make([]byte, 0, 127<<14)
 		cp.resultCommP = make(chan []byte, 1)
 		cp.layerQueues[0] = make(chan []byte, layerQueueDepth)
 		cp.addLayer(0)
 	}
 
-	cp.bytesConsumed += uint64(inputSize)
-
-	if len(cp.carry) > 0 {
-		input = append(input[:len(cp.carry)], input...)
-		copy(input[:len(cp.carry)], cp.carry)
-		cp.carry = cp.carry[:0]
-	}
-	for len(input) >= cp.blockSize {
-		processed := cp.digestLeadingBytes(input)
-		input = input[processed:]
+	for len(cp.carry)+len(input) >= cap(cp.carry) {
+		input = input[cp.digestLeadingBytes(input):]
 	}
 
 	if len(input) > 0 {
-		cp.carry = cp.carry[:len(input)]
-		copy(cp.carry, input)
+		cp.carry = append(cp.carry, input...)
 	}
 
 	return inputSize, nil
 }
 
-func (cp *Calc) digestLeadingBytes(inSlab []byte) (countProcessedBytes int) {
+func (cp *Calc) digestLeadingBytes(input []byte) (processedInputBytes int) {
 
-	// Holds this round's shifts of the original 127 bytes plus the 6 bit overflow
-	// at the end of the expansion cycle. We *do not* reuse this array: it is
-	// being fed piece-wise to hash254Into which in turn reuses it for the result
-	if len(inSlab) < 127 {
-		panic("Input shorter than 127 bytes")
-	}
-	maxCnt := 1 << uint(63-bits.LeadingZeros64(uint64(len(inSlab))/127))
+	quadsToAdd := 1 << uint(63-bits.LeadingZeros64(uint64(len(input)+len(cp.carry))/127))
 
-	maxConsumed := 1 << uint(63-bits.LeadingZeros64(cp.bytesProcessed/127))
-	minConsumed := 1 << uint(bits.TrailingZeros64(cp.bytesProcessed/127))
-	var limit int
-	if maxConsumed == minConsumed {
-		limit = maxConsumed
-	}
-	if maxConsumed == 0 {
-		limit = maxCnt
-	}
-	if minConsumed != 0 {
-		limit = minConsumed
+	// FIXME
+	carrySz := len(cp.carry)
+	input = append(cp.carry, input...)
+	cp.carry = cp.carry[:0]
+
+	firstHoldLevel := 1 << uint(bits.TrailingZeros64(cp.quadsEnqueued))
+	if firstHoldLevel != 0 && quadsToAdd > firstHoldLevel {
+		quadsToAdd = firstHoldLevel
 	}
 
-	chunkCnt := maxCnt
-	if maxCnt > limit {
-		chunkCnt = limit
-	}
+	//outSlab := bufferPool.Get(quadsToAdd * 128)
+	outSlab := make([]byte, quadsToAdd*128)
 
-	// outSlab := make([]byte, chunkCnt*128)
-	outSlab := bufferPool.Get(chunkCnt * 128)
-
-	for j := 0; j < chunkCnt; j++ {
+	for j := 0; j < quadsToAdd; j++ {
 		// Cycle over four(4) 31-byte groups, leaving 1 byte in between:
 		// 31 + 1 + 31 + 1 + 31 + 1 + 31 = 127
-		input := inSlab[j*127 : (j+1)*127]
+		input := input[j*127 : (j+1)*127]
 		expander := outSlab[j*128 : (j+1)*128]
 		inputPlus1, expanderPlus1 := input[1:], expander[1:]
 
@@ -294,10 +261,9 @@ func (cp *Calc) digestLeadingBytes(inSlab []byte) (countProcessedBytes int) {
 		expander[127] = input[126] >> 2
 	}
 
-	cp.bytesProcessed += uint64(chunkCnt) * 127
 	cp.layerQueues[0] <- outSlab
-
-	return chunkCnt * 127
+	cp.quadsEnqueued += uint64(quadsToAdd)
+	return quadsToAdd*127 - carrySz
 }
 
 func (cp *Calc) addLayer(myIdx uint) {
@@ -308,7 +274,7 @@ func (cp *Calc) addLayer(myIdx uint) {
 	cp.layerQueues[myIdx+1] = make(chan []byte, layerQueueDepth)
 
 	go func() {
-		var chunkHold []byte
+		chunkHold := make([]byte, 0, 32)
 
 		for {
 			slab, queueIsOpen := <-cp.layerQueues[myIdx]
@@ -317,13 +283,13 @@ func (cp *Calc) addLayer(myIdx uint) {
 
 				// I am last
 				if myIdx == MaxLayers || cp.layerQueues[myIdx+2] == nil {
-					cp.resultCommP <- chunkHold[0:32]
+					cp.resultCommP <- chunkHold
 					return
 				}
 
-				if chunkHold != nil {
-					copy(chunkHold[32:64], stackedNulPadding[myIdx])
-					cp.hashSlab254(0, chunkHold[0:64], cp.layerQueues[myIdx+1])
+				if len(chunkHold) != 0 {
+					cp.hash254(chunkHold, stackedNulPadding[myIdx], chunkHold)
+					cp.layerQueues[myIdx+1] <- chunkHold
 				}
 
 				// signal the next in line that they are done too
@@ -331,60 +297,44 @@ func (cp *Calc) addLayer(myIdx uint) {
 				return
 			}
 
-			if len(slab) > 1<<(5+myIdx) {
-				cp.hashSlab254(myIdx, slab, cp.layerQueues[myIdx+1])
+			if len(chunkHold) != 0 {
 				if cp.layerQueues[myIdx+2] == nil {
 					cp.addLayer(myIdx + 1)
 				}
-				continue
-			}
-			if chunkHold == nil {
-				chunkHold = slab[0:32]
+				cp.hash254(chunkHold, slab, chunkHold)
+				cp.layerQueues[myIdx+1] <- chunkHold
+				chunkHold = chunkHold[:0]
+			} else if len(slab) == 32 {
+				chunkHold = append(chunkHold, slab...)
 			} else {
-
-				// We are last right now
-				// n.b. we will not blow out of the preallocated layerQueues array,
-				// as we disallow Write()s above a certain threshold
 				if cp.layerQueues[myIdx+2] == nil {
 					cp.addLayer(myIdx + 1)
 				}
-				copy(chunkHold[32:64], slab[0:32])
-				cp.hashSlab254(0, chunkHold[0:64], cp.layerQueues[myIdx+1])
-				chunkHold = nil
+
+				//				nextOut := bufferPool.Get(len(slab) / 2)
+
+				h := shaPool.Get().(hash.Hash)
+				for i := 0; len(slab) > i+32; i += 2 * 32 {
+					h.Reset()
+					h.Write(slab[i : i+64])
+					h.Sum(slab[i/2 : i/2][:0])[31] &= 0x3F // callers expect we will reuse-reduce-recycle
+				}
+				shaPool.Put(h)
+
+				cp.layerQueues[myIdx+1] <- slab[:len(slab)/2]
+				//bufferPool.Put(slab)
 			}
 		}
 	}()
 }
 
-func (cp *Calc) hashSlab254(layerIdx uint, slab []byte, target chan []byte) {
-
-	stride := 1 << (5 + layerIdx)
-	if len(slab) < stride {
-		panic(fmt.Sprintf("wtf layerId: %d \t slab length: %d \n", layerIdx, len(slab)))
-	}
-
-	//var wg sync.WaitGroup
-	for i := 0; len(slab) > i+stride; i += 2 * stride {
-		// wg.Add(1)
-		i := i
-		//	go func() {
-		h := shaPool.Get().(hash.Hash)
-		h.Reset()
-		h.Write(slab[i : i+32])
-		h.Write(slab[i+stride : 32+i+stride])
-		// fmt.Printf("L:%d  left : %X, right : %X\n", layerIdx, slab[i:i+32],  slab[i+stride : 32+i+stride])
-		//h.Sum(slab[i:i])[31] &= 0x3F    // callers expect we will reuse-reduce-recycle
-		h.Sum(slab[i:i])[31] &= 0x3F // callers expect we will reuse-reduce-recycle
-		// fmt.Printf("res :  %X, layer : %d\n", slab[i:i+32], layerIdx)
-		//if bytes.Equal(slab[i:i+2], []byte{0x97,0xA1}) {
-		//	panic("panisc")
-		//}
-		shaPool.Put(h)
-		//wg.Done()
-		//	}()
-	}
-	//wg.Wait()
-	target <- slab
+func (cp *Calc) hash254(left, right, out []byte) {
+	h := shaPool.Get().(hash.Hash)
+	h.Reset()
+	h.Write(left)
+	h.Write(right)
+	h.Sum(out[:0])[31] &= 0x3F // callers expect we will reuse-reduce-recycle
+	shaPool.Put(h)
 }
 
 // PadCommP is experimental, do not use it.
